@@ -19,7 +19,7 @@ use axum::{
 };
 use flate2::read::GzDecoder;
 use rijksdriehoek::rijksdriehoek_to_wgs84;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
 use zeromq::{Socket, SocketRecv};
@@ -71,11 +71,77 @@ struct VehiclePosition {
     lon: f64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct Passtime {
+    data_owner_code: String,
+    operation_date: String,
+    line_planning_number: String,
+    journey_number: i32,
+    user_stop_order_number: i32,
+    user_stop_code: String,
+    journey_pattern_code: String,
+    line_direction: i32,
+    last_update_time_stamp: String,
+    destination_code: String,
+    #[serde(deserialize_with = "bool_from_int")]
+    is_timing_stop: bool,
+    expected_arrival_time: String,
+    expected_departure_time: String,
+    trip_stop_status: String,
+    timing_point_code: String,
+    journey_stop_type: String,
+    target_arrival_time: String,
+    target_departure_time: String,
+    #[serde(deserialize_with = "option_from_null")]
+    recorded_arrival_time: Option<String>,
+    #[serde(deserialize_with = "option_from_null")]
+    recorded_departure_time: Option<String>,
+    detected_user_stop_code: String,
+    distance_since_detected_user_stop: i32,
+    #[serde(deserialize_with = "option_from_null")]
+    #[serde(rename = "Detected_RD_X")]
+    detected_rd_x: Option<String>,
+    #[serde(deserialize_with = "option_from_null")]
+    #[serde(rename = "Detected_RD_Y")]
+    detected_rd_y: Option<String>,
+    #[serde(deserialize_with = "option_from_null")]
+    vehicle_number: Option<i32>,
+    #[serde(deserialize_with = "option_from_null")]
+    line_dest_icon: Option<String>,
+    line_dest_color: String,
+    line_dest_text_color: String,
+}
+
+fn bool_from_int<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    Ok(s == "1")
+}
+
+fn option_from_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: FromStr,
+    <T as FromStr>::Err: std::fmt::Display,
+{
+    let s = String::deserialize(deserializer)?;
+    if s == "\\0" {
+        Ok(None)
+    } else {
+        Ok(Some(T::from_str(&s).map_err(serde::de::Error::custom)?))
+    }
+}
+
 type VehiclePositionMap = Arc<RwLock<BTreeMap<i32, VehiclePosition>>>;
+type PasstimeMap = Arc<RwLock<BTreeMap<i32, Passtime>>>;
 
 #[derive(Debug, Clone)]
 struct RouterState {
     vehicle_positions: VehiclePositionMap,
+    passtimes: PasstimeMap,
     live_tx: tokio::sync::broadcast::Sender<VehiclePosition>,
 }
 
@@ -84,12 +150,13 @@ async fn main() -> Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "example_websockets=debug,tower_http=debug".into()),
+                .unwrap_or_else(|_| "ovlive=debug,tower_http=debug".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
     let vehicle_positions: VehiclePositionMap = Default::default();
+    let passtimes: PasstimeMap = Default::default();
     let (live_tx, _) = tokio::sync::broadcast::channel::<VehiclePosition>(64);
 
     tokio::spawn({
@@ -144,82 +211,116 @@ async fn main() -> Result<()> {
                             .write()
                             .unwrap()
                             .insert(journey_number, vehicle_position);
+
+                        eprint!(".");
                     }
                 }
             }
         }
     });
 
-    tokio::spawn(async move {
-        let mut socket = zeromq::SubSocket::new();
-        socket
-            .connect("tcp://pubsub.ndovloket.nl:7817")
-            .await
-            .context("Failed to connect")
-            .unwrap();
+    tokio::spawn({
+        let passtimes = passtimes.clone();
+        async move {
+            let mut socket = zeromq::SubSocket::new();
+            socket
+                .connect("tcp://pubsub.ndovloket.nl:7817")
+                .await
+                .context("Failed to connect")
+                .unwrap();
 
-        tracing::info!("Connected to KV78Turbo");
+            tracing::info!("Connected to KV78Turbo");
 
-        socket.subscribe("/GOVI/KV8").await.unwrap();
+            socket.subscribe("/GOVI/KV8").await.unwrap();
 
-        let mut seen_keys = HashSet::<String>::new();
+            let mut seen_keys = HashSet::<String>::new();
 
-        loop {
-            let res = socket.recv().await.unwrap();
+            loop {
+                let res = socket.recv().await.unwrap();
 
-            let mut decoder = GzDecoder::new(&res.get(1).unwrap()[..]);
-            let mut s = String::new();
-            decoder.read_to_string(&mut s).unwrap();
+                let mut decoder = GzDecoder::new(&res.get(1).unwrap()[..]);
+                let mut s = String::new();
+                decoder.read_to_string(&mut s).unwrap();
 
-            #[derive(Debug)]
-            struct RecordHeader<'a> {
-                record_type: &'a str,
-                data_owner: &'a str,
-                timestamp: &'a str,
-            }
+                #[derive(Debug)]
+                struct RecordHeader<'a> {
+                    record_type: &'a str,
+                    data_owner: &'a str,
+                    timestamp: &'a str,
+                }
 
-            // \G] KV8turbo_passtimes|KV8turbo_passtimes|whatever  <\r\n
-            // \T>  DATEDPASSTIME|DATEDPASSTIME|whatever <\r\n
-            // \L> DataOwnerCode|OperationDate|etc\r\n
-            // value|value|value\r\n
-            // value|value|value  <\r\n
-            // \T>  NEWPASSTIMES|NEWPASSTIMES|whatever <\r\n
-            // \L> DataOwnerCode|OperationDate|etc\r\n
-            // value|value|value\r\n
+                let mut parts = s.split("\r\n\\T");
+                let header = parts.next().unwrap();
 
-            let mut parts = s.split("\r\n\\T");
-            let header = parts.next().unwrap();
+                let mut header = header.trim_start_matches(r"\G").split('|');
+                let header = RecordHeader {
+                    record_type: header.next().unwrap(),
+                    data_owner: header.nth(1).unwrap(),
+                    timestamp: header.nth(4).unwrap(),
+                };
 
-            let mut header = header.trim_start_matches(r"\G").split('|');
-            let header = RecordHeader {
-                record_type: header.next().unwrap(),
-                data_owner: header.nth(1).unwrap(),
-                timestamp: header.nth(4).unwrap(),
-            };
+                if header.data_owner != "QBUZZ" {
+                    continue;
+                }
 
-            // if header.data_owner != "QBUZZ" {
-            //     continue;
-            // }
+                let tables = parts
+                    .map(|table| {
+                        let mut table = table.split("\r\n\\L");
+                        let name = table.next().unwrap().split('|').next().unwrap();
+                        let data = table.next().unwrap();
 
-            let tables = parts.map(|table| {
-                let mut table = table.split("\r\n\\L");
-                let name = table.next().unwrap().split('|').next().unwrap();
-                let data = table.next().unwrap();
+                        (name, data)
+                    })
+                    .collect::<HashMap<&str, &str>>();
 
-                (name, data)
-            }).collect::<HashMap<&str, &str>>();
+                for &key in tables.keys() {
+                    if !seen_keys.contains(&key.to_owned()) {
+                        seen_keys.insert(key.to_owned());
+                        println!("New key: {key}");
+                        let value = tables.get(key).unwrap();
 
-            for &key in tables.keys() {
-                if !seen_keys.contains(&key.to_owned()) {
-                    seen_keys.insert(key.to_owned());
-                    println!("New key: {key}");
-                    let value = tables.get(key).unwrap();
+                        let res = std::fs::write(format!("kv78t-{key}.csv"), value);
+                        dbg!(res);
+                    }
+                }
 
-                    let res = std::fs::write(format!("kv78t-{key}.csv"), value);
-                    dbg!(res);
+                if let Some(table) = tables.get("DATEDPASSTIME") {
+                    let mut rdr = csv::ReaderBuilder::new()
+                        .delimiter(b'|')
+                        .has_headers(true)
+                        .from_reader(table.as_bytes());
+
+                    for result in rdr
+                        .deserialize::<Passtime>()
+                        .map(|r| handle_err(r, table.as_bytes()))
+                        .filter_map(Result::ok)
+                    {
+                        passtimes
+                            .write()
+                            .unwrap()
+                            .insert(result.journey_number, result);
+
+                        eprint!("'");
+                    }
+                }
+
+                fn handle_err<T>(r: csv::Result<T>, input: &[u8]) -> csv::Result<T> {
+                    if let Err(ref e) = r {
+                        if let Some(pos) = e.position() {
+                            eprintln!("{e:?}");
+                            eprintln!(
+                                "Error at byte {}: {:?}",
+                                pos.byte(),
+                                String::from_utf8_lossy(&input[(pos.byte() + 1) as usize..])
+                                    .lines()
+                                    .next()
+                                    .unwrap()
+                            );
+                        }
+                    }
+                    r
                 }
             }
-
         }
     });
 
@@ -232,6 +333,7 @@ async fn main() -> Result<()> {
             )
             .with_state(RouterState {
                 vehicle_positions: vehicle_positions.clone(),
+                passtimes: passtimes.clone(),
                 live_tx: live_tx.clone(),
             });
 
